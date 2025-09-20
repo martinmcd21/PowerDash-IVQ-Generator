@@ -1,6 +1,0 @@
-streamlit
-openai
-python-docx
-reportlab
-python-dotenv
-requests
