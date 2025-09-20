@@ -1,215 +1,162 @@
-import io, os, requests
-from typing import Dict, List
-from docx import Document
-from docx.shared import Pt, Inches
-from docx.oxml.ns import qn
+import os
+import streamlit as st
+from dotenv import load_dotenv
 
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader
+load_dotenv()
+st.set_page_config(page_title="Interview Question Pack Generator", page_icon="❓", layout="wide")
 
-FONT_NAME = "Source Sans 3"
+# ---------- Styles ----------
+GOOGLE_FONTS = "https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@300;400;600;700&display=swap"
+st.markdown(f"<link href='{GOOGLE_FONTS}' rel='stylesheet'>", unsafe_allow_html=True)
+st.markdown("""
+<style>
+  html, body, [class*="css"], textarea, input { font-family:'Source Sans 3', -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif !important; }
+  .muted { opacity:.9; }
+  .section-title { font-weight:700; font-size:1.1rem; margin:1rem 0 .25rem; }
+  .powerdash-footer { margin-top:2rem; padding-top:.75rem; border-top:1px solid rgba(0,0,0,.08); text-align:center; opacity:.85; }
+  .brand-chip { display:inline-flex; align-items:center; gap:.5rem; padding:.25rem .5rem; border-radius:999px; background:#fffbe6; border:1px solid #ffe58f; }
+  .q-card { border:1px solid rgba(0,0,0,.08); border-radius:12px; padding:12px; margin:.5rem 0; }
+  .q-intent { opacity:.85; font-size:.95rem; }
+  .notes-lines { height:8px; border-bottom:1px dashed #d0d7de; margin:10px 0; }
+  .logo-row { display:flex; gap:12px; justify-content:flex-end; align-items:center; }
+  .logo-row img { max-height:40px; border-radius:8px; background:white; }
+</style>
+""", unsafe_allow_html=True)
 
-def _set_document_defaults(doc: Document):
-    style = doc.styles['Normal']
-    style.font.name = FONT_NAME
-    style._element.rPr.rFonts.set(qn('w:eastAsia'), FONT_NAME)
-    style.font.size = Pt(11)
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.header("⚙️ Settings")
+    st.caption("Branding and generation options.")
+    tenant_name = st.text_input("Organisation (optional)")
+    primary_colour = st.color_picker("Primary colour", "#111827")
+    logo_url = st.text_input("Client logo URL (optional)")
+    show_powerdash = st.toggle("Show 'Powered by PowerDash HR'", value=True)
 
-def _add_heading(doc: Document, text: str):
-    p = doc.add_paragraph()
-    run = p.add_run(text)
-    run.bold = True
-    run.font.size = Pt(16)
+    default_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    model = st.text_input("OpenAI model", value=default_model)
+    temperature = st.slider("Creativity (temperature)", 0.0, 1.2, 0.3, 0.1)
 
-def _add_question_block(doc: Document, q: Dict):
-    doc.add_paragraph("")
-    p = doc.add_paragraph()
-    p.add_run("Q: ").bold = True
-    p.add_run(q.get("q", ""))
-    if q.get("intent"):
-        p2 = doc.add_paragraph(); p2.add_run("Intent: ").italic = True; p2.add_run(q["intent"])
-    if q.get("good"):
-        p3 = doc.add_paragraph(); p3.add_run("What good looks like: ").italic = True; p3.add_run(q["good"])
-    if q.get("followups"):
-        p4 = doc.add_paragraph(); p4.add_run("Follow-ups: ").italic = True; p4.add_run(", ".join(q["followups"]))
-    for _ in range(4):
-        doc.add_paragraph("_______________________________")
+    language = st.selectbox("Language", ["English", "Français", "Deutsch", "Español", "Italiano"], 0)
+    jurisdiction = st.selectbox("Jurisdiction", ["Global", "UK", "USA", "EU", "Canada", "Australia"], 1)
 
-def _parse_questions(lines: List[str]) -> List[Dict]:
-    qs = []; q = {"q": "", "intent": "", "followups": [], "good": ""}
-    def flush():
-        if q["q"].strip(): qs.append(q.copy())
-    for raw in lines:
-        line = raw.strip()
-        if not line: continue
-        l = line.lower()
-        if l.startswith(("question:", "q:")):
-            flush(); q = {"q": line.split(":",1)[1].strip(), "intent":"", "followups":[], "good":""}
-        elif l.startswith("intent:"):
-            q["intent"] = line.split(":",1)[1].strip()
-        elif l.startswith(("follow-up:", "follow-ups:")):
-            val = line.split(":",1)[1]; q["followups"] = [x.strip("- • ") for x in val.split(";") if x.strip()]
-        elif l.startswith(("what good looks like:", "good:", "model answer:", "scoring hint:")):
-            q["good"] = line.split(":",1)[1].strip()
-        elif line.startswith("-") and not q["q"]:
-            q["q"] = line.lstrip("- "); flush(); q = {"q": "", "intent":"", "followups":[], "good":""}
-    flush(); return qs
-
-def _add_footer_powerdash(doc: Document, pd_logo_path: str):
-    """Set a footer with the PowerDash logo + text for all sections (repeats every page)."""
-    for section in doc.sections:
-        footer = section.footer
-        footer.is_linked_to_previous = False
-        p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
-        run = p.add_run()
-        # Try to place logo if available
-        try:
-            if pd_logo_path and os.path.exists(pd_logo_path):
-                run.add_picture(pd_logo_path, width=Inches(0.6))
-                p.add_run("  Powered by PowerDash HR").italic = True
-            else:
-                p.add_run("Powered by PowerDash HR").italic = True
-        except Exception:
-            p.add_run("Powered by PowerDash HR").italic = True
-
-def pack_to_docx(pack: Dict, tenant_name: str = "", logo_url: str = "", pd_logo_path: str = "assets/powerdash-logo.png") -> bytes:
-    from docx.shared import Inches
-    doc = Document()
-    _set_document_defaults(doc)
-
-    # Header (client logo + meta)
-    if logo_url:
-        try:
-            img = requests.get(logo_url, timeout=6).content
-            doc.add_picture(io.BytesIO(img), width=Inches(1.4))
-        except Exception:
-            pass
-
-    _add_heading(doc, pack["title"])
-    sub = doc.add_paragraph()
-    sub.add_run(f"Interview type: {pack['inputs'].get('interview_type')} · Duration: {pack['inputs'].get('duration_mins')} mins")
+# ---------- Header ----------
+left, right = st.columns([0.72, 0.28])
+with left:
+    title = "Interview Question Pack Generator"
     if tenant_name:
-        t = doc.add_paragraph(tenant_name); t.runs[0].font.size = Pt(10)
+        title += f" — {tenant_name}"
+    st.title(title)
+    st.caption("Generate a structured, competency-based interview pack with space for notes and a scoring rubric.")
 
-    # Sections
-    for name, lines in pack["sections"].items():
-        doc.add_paragraph(""); _add_heading(doc, name)
-        qs = _parse_questions(lines)
-        if qs:
-            for q in qs: _add_question_block(doc, q)
-        else:
-            doc.add_paragraph("\n".join([ln for ln in lines if ln.strip()]))
-
-    # Footer on every page
-    _add_footer_powerdash(doc, pd_logo_path)
-
-    bio = io.BytesIO(); doc.save(bio); bio.seek(0)
-    return bio.getvalue()
-
-def pack_to_pdf(pack: Dict, tenant_name: str = "", logo_url: str = "", pd_logo_path: str = "assets/powerdash-logo.png") -> bytes:
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    width, height = A4
-
-    x = 20 * mm; y = height - 20 * mm
-
-    # Client logo (top)
+with right:
+    # Client logo (URL) + PowerDash logo (local asset or URL from Secrets)
+    html = "<div class='logo-row'>"
     if logo_url:
+        html += f"<img src='{logo_url}' alt='Client logo'/>"
+    pd_asset = "assets/powerdash-logo.png"
+    pd_url = st.secrets.get("POWERDASH_LOGO_URL", "")
+    if os.path.exists(pd_asset):
+        st.image(pd_asset, width=140)  # render local asset cleanly
+        html = ""  # we've already placed one image; don't double-render
+    elif pd_url:
+        html += f"<img src='{pd_url}' alt='PowerDash HR'/>"
+    html += "</div>"
+    if html != "</div>":
+        st.markdown(html, unsafe_allow_html=True)
+
+# ---------- Inputs ----------
+st.subheader("Role Details")
+col1, col2, col3 = st.columns(3)
+with col1:
+    role_title = st.text_input("Role title", placeholder="e.g., Senior Data Analyst")
+    level = st.selectbox("Seniority", ["Entry", "Associate", "Mid", "Senior", "Lead", "Manager", "Director"], 3)
+with col2:
+    department = st.text_input("Department/Function", placeholder="Analytics")
+    interview_type = st.selectbox("Interview type", ["Screen", "Technical", "Competency", "Panel", "Final"], 2)
+with col3:
+    duration_mins = st.number_input("Duration (minutes)", 20, 180, 60, 5)
+
+st.subheader("Content Controls")
+col4, col5, col6 = st.columns(3)
+with col4:
+    num_core = st.slider("# Core questions", 2, 10, 4)
+    include_followups = st.toggle("Include suggested follow-ups", True)
+with col5:
+    num_technical = st.slider("# Technical questions", 0, 10, 3)
+    include_good_looks_like = st.toggle("Include 'what good looks like'", True)
+with col6:
+    num_competency = st.slider("# Competency questions", 0, 12, 5)
+    include_scoring = st.toggle("Include scoring rubric", True)
+
+competencies = st.text_area(
+    "Target competencies (one per line)",
+    height=120,
+    placeholder="Problem solving\nStakeholder management\nCommunication\nOwnership",
+)
+house_guidance = st.text_area(
+    "House guidance (optional)", height=100,
+    placeholder="Use UK English. Keep questions short, open, and behaviour-based. Avoid discriminatory topics.",
+)
+
+# ---------- Action ----------
+if st.button("Generate Interview Pack", type="primary"):
+    # Lazy imports so a module error doesn't blank the app
+    try:
+        from utils.generation_iqt import generate_interview_pack
+    except Exception as e:
+        st.error(f"Couldn't load generator module (utils/generation_iqt.py).\n\n**Import error:** {e}")
+        st.stop()
+    try:
+        from utils.export_iqt import pack_to_docx, pack_to_pdf
+    except Exception as e:
+        st.warning(f"Export module failed to load; generation will still work.\n\n**Import error:** {e}")
+        pack_to_docx = pack_to_pdf = None
+
+    with st.spinner("Drafting your pack…"):
         try:
-            c.drawImage(ImageReader(logo_url), x, y-15*mm, width=30*mm, height=15*mm,
-                        preserveAspectRatio=True, mask='auto')
-        except Exception:
-            pass
+            inputs = {
+                "role_title": role_title, "level": level, "department": department,
+                "interview_type": interview_type, "duration_mins": duration_mins,
+                "num_core": num_core, "num_technical": num_technical, "num_competency": num_competency,
+                "competencies": [x.strip() for x in (competencies or "").split("\n") if x.strip()],
+                "include_followups": include_followups, "include_good_looks_like": include_good_looks_like,
+                "include_scoring": include_scoring, "language": language, "jurisdiction": jurisdiction,
+                "tenant_name": tenant_name, "logo_url": logo_url, "primary_colour": primary_colour,
+                "house_guidance": house_guidance,
+            }
+            pack = generate_interview_pack(inputs=inputs, model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"), temperature=0.3)
+        except Exception as e:
+            st.error(f"Generation failed: {e}")
+            st.stop()
 
-    # Title/meta
-    c.setFont("Helvetica-Bold", 14); c.drawString(x, y-18*mm, pack["title"])
-    c.setFont("Helvetica", 10)
-    c.drawString(x, y-23*mm, f"Interview type: {pack['inputs'].get('interview_type')} · Duration: {pack['inputs'].get('duration_mins')} mins")
-    if tenant_name: c.drawString(x, y-28*mm, tenant_name)
+    st.success("Interview pack ready ✨")
+    st.markdown(pack["html_preview"], unsafe_allow_html=True)
 
-    cur_y = y - 35*mm
-    def add_notes_lines(n=4):
-        nonlocal cur_y
-        for _ in range(n):
-            c.line(x, cur_y, width - x, cur_y); cur_y -= 6
-        cur_y -= 2
-
-    def write_wrapped(text, bold=False, size=None):
-        nonlocal cur_y
-        font = "Helvetica-Bold" if bold else "Helvetica"
-        size = 11 if bold else 10 if size is None else size
-        c.setFont(font, size); max_w = width - 2*x
-        words, line = text.split(), ""
-        for w in words:
-            trial = (line + " " + w).strip()
-            if c.stringWidth(trial, font, size) > max_w:
-                c.drawString(x, cur_y, line); cur_y -= 12; line = w
-            else:
-                line = trial
-        if line: c.drawString(x, cur_y, line); cur_y -= 12
-
-    def draw_footer():
-        # PowerDash logo + text centered at bottom
-        footer_y = 12*mm
+    # --- Exports with PowerDash footer logo on every page ---
+    pd_logo_path = "assets/powerdash-logo.png"
+    st.subheader("Export")
+    if pack_to_docx:
         try:
-            if pd_logo_path and os.path.exists(pd_logo_path):
-                img = ImageReader(pd_logo_path)
-                img_w = 14*mm; img_h = 14*mm
-                cx = width/2
-                c.drawImage(img, cx - img_w - 12, footer_y-3, width=img_w, height=img_h,
-                            preserveAspectRatio=True, mask='auto')
-                c.setFont("Helvetica-Oblique", 9)
-                c.drawString(cx - 12, footer_y+3, "Powered by PowerDash HR")
-            else:
-                c.setFont("Helvetica-Oblique", 9)
-                c.drawCentredString(width/2, footer_y+3, "Powered by PowerDash HR")
-        except Exception:
-            c.setFont("Helvetica-Oblique", 9)
-            c.drawCentredString(width/2, footer_y+3, "Powered by PowerDash HR")
+            docx_bytes = pack_to_docx(pack, tenant_name=tenant_name, logo_url=logo_url, pd_logo_path=pd_logo_path)
+            st.download_button("⬇️ Download DOCX", data=docx_bytes, file_name=f"{pack['slug']}.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        except Exception as e:
+            st.warning(f"DOCX export failed: {e}")
+    if pack_to_pdf:
+        try:
+            pdf_bytes = pack_to_pdf(pack, tenant_name=tenant_name, logo_url=logo_url, pd_logo_path=pd_logo_path)
+            st.download_button("⬇️ Download PDF", data=pdf_bytes, file_name=f"{pack['slug']}.pdf",
+                               mime="application/pdf")
+        except Exception as e:
+            st.warning(f"PDF export failed: {e}")
 
-    # Content with pagination
-    for name, lines in pack["sections"].items():
-        write_wrapped(name, bold=True)
-        # parse questions lightly: bullet or labelled items
-        qs = []
-        q = {"q": "", "intent": "", "followups": [], "good": ""}
-        def flush():
-            if q["q"].strip(): qs.append(q.copy())
-        for raw in lines:
-            line = raw.strip()
-            if not line: continue
-            l = line.lower()
-            if l.startswith(("question:", "q:")):
-                flush(); q = {"q": line.split(":",1)[1].strip(), "intent":"", "followups":[], "good":""}
-            elif l.startswith("intent:"):
-                q["intent"] = line.split(":",1)[1].strip()
-            elif l.startswith(("follow-up:", "follow-ups:")):
-                val = line.split(":",1)[1]; q["followups"] = [x.strip("- • ") for x in val.split(";") if x.strip()]
-            elif l.startswith(("what good looks like:", "good:", "model answer:", "scoring hint:")):
-                q["good"] = line.split(":",1)[1].strip()
-            elif line.startswith("-") and not q["q"]:
-                q["q"] = line.lstrip("- "); flush(); q = {"q": "", "intent":"", "followups":[], "good":""}
-        flush()
-
-        if qs:
-            for item in qs:
-                write_wrapped(f"Q: {item['q']}")
-                if item.get('intent'): write_wrapped(f"Intent: {item['intent']}")
-                if item.get('good'): write_wrapped(f"What good looks like: {item['good']}")
-                if item.get('followups'): write_wrapped("Follow-ups: " + ", ".join(item['followups']))
-                add_notes_lines(4)
-                if cur_y < 40*mm:
-                    draw_footer(); c.showPage()
-                    cur_y = A4[1] - 20*mm
-        else:
-            write_wrapped(" ".join([ln for ln in lines if ln.strip()]))
-
-        cur_y -= 6
-        if cur_y < 40*mm:
-            draw_footer(); c.showPage()
-            cur_y = A4[1] - 20*mm
-
-    draw_footer(); c.save()
-    buffer.seek(0); return buffer.getvalue()
+# ---------- Footer (on the web app) ----------
+if show_powerdash:
+    st.markdown(
+        f"""
+        <div class='powerdash-footer'>
+            <span class='brand-chip' style='--chip-bg:{primary_colour}10'>⚡️ Powered by <strong>PowerDash HR</strong></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
