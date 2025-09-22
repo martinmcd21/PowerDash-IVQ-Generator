@@ -176,31 +176,24 @@ def pack_to_pdf(
     """
     Polished PDF with full-width question line, label/value rows below,
     generous WHITE SPACE for notes, and PD footer logo on every page.
+    Uses pre-measurement to avoid squashing.
     """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
-    x = 20 * mm
-    y = H - 20 * mm
 
-    # Client logo
-    if logo_url:
-        try:
-            c.drawImage(ImageReader(logo_url), x, y - 15 * mm, width=30 * mm, height=15 * mm,
-                        preserveAspectRatio=True, mask="auto")
-        except Exception:
-            pass
+    # Layout constants
+    MARGIN_X = 22 * mm
+    TOP_Y    = H - 22 * mm
+    LINE     = 15                 # line height
+    PAD      = 6                  # inner padding inside question block
+    NOTES_LINES = 7               # blank lines worth of white space (no rules)
 
-    # Title & meta
-    c.setFont("Helvetica-Bold", 15); c.drawString(x, y - 18 * mm, pack.get("title", "Interview Pack"))
-    c.setFont("Helvetica", 11)
-    meta = f"Interview type: {pack['inputs'].get('interview_type')} · Duration: {pack['inputs'].get('duration_mins')} mins"
-    c.drawString(x, y - 24 * mm, meta)
-    if tenant_name: c.drawString(x, y - 30 * mm, tenant_name)
+    x = MARGIN_X
+    y = TOP_Y
+    cur_y = y
 
-    cur_y = y - 40 * mm
-    LINE = 14  # line height (more generous)
-
+    # ---------- helpers ----------
     def footer():
         fy = 12 * mm
         try:
@@ -219,17 +212,149 @@ def pack_to_pdf(
             c.setFont("Helvetica-Oblique", 9)
             c.drawCentredString(W / 2, 12 * mm + 3, "Powered by PowerDash HR")
 
-    def ensure_space(lines_needed: int = 12):
-        nonlocal cur_y
-        if cur_y < (40 * mm + lines_needed * LINE):
-            footer(); c.showPage(); cur_y = H - 20 * mm
+    def _wrap(text, width, font="Helvetica", size=11):
+        words = (text or "").split()
+        out, line = [], ""
+        for w in words:
+            t = (line + " " + w).strip()
+            if c.stringWidth(t, font, size) > width:
+                if line: out.append(line)
+                line = w
+            else:
+                line = t
+        if line: out.append(line)
+        return out
 
-    def draw_bullets(items: List[str]):
+    def ensure_space(px_needed: float):
         nonlocal cur_y
+        if cur_y - px_needed < 40 * mm:   # keep a bottom buffer
+            footer()
+            c.showPage()
+            # reset page top
+            # (optional) redraw header elements per page if you want; keeping clean for now
+            cur_y = TOP_Y
+
+    # ---------- header ----------
+    # Client logo
+    if logo_url:
+        try:
+            c.drawImage(ImageReader(logo_url), x, y - 15 * mm, width=30 * mm, height=15 * mm,
+                        preserveAspectRatio=True, mask="auto")
+        except Exception:
+            pass
+
+    # Title & meta
+    c.setFont("Helvetica-Bold", 15); c.drawString(x, y - 18 * mm, pack.get("title", "Interview Pack"))
+    c.setFont("Helvetica", 11)
+    meta = f"Interview type: {pack['inputs'].get('interview_type')} · Duration: {pack['inputs'].get('duration_mins')} mins"
+    c.drawString(x, y - 24 * mm, meta)
+    if tenant_name: c.drawString(x, y - 30 * mm, tenant_name)
+
+    cur_y = y - 40 * mm
+
+    # ---------- sections of bullets ----------
+    def draw_bullets(title: str, items: List[str]):
+        nonlocal cur_y
+        if not items: return
+        c.setFont("Helvetica-Bold", 13); c.drawString(x, cur_y, title); cur_y -= LINE
         c.setFont("Helvetica", 11)
         for item in items:
-            for ln in _wrap_lines(c, "• " + (item or ""), W - 2 * x, size=11):
+            for ln in _wrap("• " + (item or ""), W - 2 * x, size=11):
                 c.drawString(x, cur_y, ln); cur_y -= LINE
+        cur_y -= 4
+
+    # Housekeeping
+    draw_bullets("Housekeeping", pack.get("housekeeping") or [])
+
+    # ---------- question block (pre-measured) ----------
+    def question_block(q: Dict):
+        nonlocal cur_y
+        left, right = x, W - x
+        text_width = right - left - 2 * PAD
+
+        # Prepare wrapped lines
+        q_lines = _wrap((q.get("question") or "").strip(), text_width, font="Helvetica-Bold", size=12)
+
+        intent_lines = _wrap(q.get("intent") or "", text_width - 90, size=11)  # label column ~90 px
+        good_lines   = _wrap(q.get("good") or "", text_width - 150, size=11)
+        fup_lines    = _wrap(", ".join((q.get("followups") or [])[:6]) if q.get("followups") else "", text_width - 110, size=11)
+
+        # Estimate height needed
+        rows_height = len(q_lines)*LINE + 4
+        if intent_lines: rows_height += LINE * (len(intent_lines)+1)
+        if good_lines:   rows_height += LINE * (len(good_lines)+1)
+        if fup_lines:    rows_height += LINE * (len(fup_lines)+1)
+        notes_height = NOTES_LINES * LINE
+        block_h = PAD + rows_height + notes_height + PAD
+
+        ensure_space(block_h + 10)
+
+        # Draw container box
+        bottom_y = cur_y - block_h
+        c.setLineWidth(1)
+        c.roundRect(left, bottom_y, right-left, block_h, 6, stroke=1, fill=0)
+
+        # Write inside with padding
+        ty = cur_y - PAD
+
+        # Question (full width)
+        c.setFont("Helvetica-Bold", 12)
+        for ln in q_lines:
+            c.drawString(left + PAD, ty, ln); ty -= LINE
+        ty -= 2
+
+        # Label/value rows
+        def row(lbl, lines, label_min):
+            nonlocal ty
+            if not lines: return
+            c.setFont("Helvetica-Bold", 11)
+            c.drawString(left + PAD, ty, f"{lbl}:")
+            lbl_w = max(label_min, c.stringWidth(f"{lbl}:", "Helvetica-Bold", 11))
+            c.setFont("Helvetica", 11)
+            for ln in lines:
+                c.drawString(left + PAD + lbl_w, ty, ln); ty -= LINE
+            ty -= 2
+
+        if intent_lines: row("Intent", intent_lines, label_min=60)
+        if good_lines:   row("What good looks like", good_lines, label_min=150)
+        if fup_lines:    row("Follow-ups", fup_lines, label_min=110)
+
+        # White space for notes
+        ty -= notes_height
+
+        # Move cursor for next block
+        cur_y = bottom_y - 10  # small gap below the box
+
+    # ---------- draw sections & questions ----------
+    for sec in pack.get("sections", []):
+        name = sec.get("name", "Section")
+        bullets = sec.get("bullets") or []
+
+        # Section title
+        c.setFont("Helvetica-Bold", 13); c.drawString(x, cur_y, name); cur_y -= LINE
+
+        # Optional bullets/notes
+        if bullets:
+            c.setFont("Helvetica", 11)
+            for item in bullets:
+                for ln in _wrap("• " + (item or ""), W - 2*x, size=11):
+                    c.drawString(x, cur_y, ln); cur_y -= LINE
+            cur_y -= 4
+
+        if sec.get("notes"):
+            c.setFont("Helvetica", 11)
+            for ln in _wrap(sec["notes"], W - 2*x, size=11):
+                c.drawString(x, cur_y, ln); cur_y -= LINE
+            cur_y -= 4
+
+        # Questions
+        for q in (sec.get("questions") or []):
+            question_block(q)
+
+    footer()
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
 
     # ---- QUESTION BLOCK (PDF) ----
     def question_box(q: Dict):
