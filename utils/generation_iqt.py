@@ -1,302 +1,136 @@
-# utils/export_iqt.py
-import io, os, requests
+import os, json, re, textwrap
+from datetime import date
 from typing import Dict, List
+from functools import lru_cache
+from openai import OpenAI
 
-# ---------- DOCX ----------
-from docx import Document
-from docx.shared import Pt, Inches
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
+SECTION_ORDER = [
+    "Housekeeping",
+    "Overview",
+    "Core Questions",
+    "Competency Questions",
+    "Technical Questions",
+    "Culture & Values",
+    "Closing Questions",
+    "Scoring Rubric",
+]
 
-# ---------- PDF ----------
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib.units import mm
-from reportlab.lib.utils import ImageReader
-
-FONT_NAME = "Source Sans 3"
-
-# ------------------------------
-# Helpers (DOCX)
-# ------------------------------
-def _set_document_defaults(doc: Document):
-    style = doc.styles["Normal"]
-    style.font.name = FONT_NAME
-    style._element.rPr.rFonts.set(qn("w:eastAsia"), FONT_NAME)
-    style.font.size = Pt(11)
-
-def _ruled_paragraph(doc, width_chars: int = 100):
-    # Creates a dashed underline row for handwritten notes
-    p = doc.add_paragraph(" ")
-    p.paragraph_format.space_after = Pt(2)
-    p_pr = p._element.get_or_add_pPr()
-    p_brd = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "dashed")
-    bottom.set(qn("w:sz"), "6")
-    bottom.set(qn("w:space"), "1")
-    bottom.set(qn("w:color"), "D1D5DB")
-    p_brd.append(bottom)
-    p_pr.append(p_brd)
-
-def _add_footer_powerdash(doc: Document, pd_logo_path: str):
-    # Attach a PD logo + text footer to every section → appears on every page
-    for section in doc.sections:
-        footer = section.footer
-        footer.is_linked_to_previous = False
-        p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
-        run = p.add_run()
+@lru_cache(maxsize=1)
+def _client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
         try:
-            if pd_logo_path and os.path.exists(pd_logo_path):
-                run.add_picture(pd_logo_path, width=Inches(0.6))
-                p.add_run("  Powered by PowerDash HR").italic = True
-            else:
-                p.add_run("Powered by PowerDash HR").italic = True
-        except Exception:
-            p.add_run("Powered by PowerDash HR").italic = True
-
-def _add_question_table(doc: Document, q: Dict):
-    # q = {"question", "intent", "followups"[], "good"}
-    tbl = doc.add_table(rows=0, cols=2)
-    tbl.autofit = True
-
-    rows = [("Question", q.get("question", "").strip())]
-    if q.get("intent"):
-        rows.append(("Intent", q["intent"]))
-    if q.get("followups"):
-        rows.append(("Follow-ups", ", ".join(q["followups"][:6])))
-    if q.get("good"):
-        rows.append(("What good looks like", q["good"]))
-
-    for label, val in rows:
-        if not val:
-            continue
-        cells = tbl.add_row().cells
-        cells[0].text = label
-        try:
-            cells[0].paragraphs[0].runs[0].bold = True
+            import streamlit as st
+            api_key = st.secrets.get("OPENAI_API_KEY")
         except Exception:
             pass
-        cells[1].text = val
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not found in env or Streamlit Secrets.")
+    return OpenAI(api_key=api_key)
 
-    # ruled notes (executive look)
-    doc.add_paragraph("")
-    for _ in range(5):
-        _ruled_paragraph(doc)
-    doc.add_paragraph("")
+def _slug(s: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (s or "interview-pack").lower()).strip("-")
+    return f"{s}-{date.today().isoformat()}"
 
-def pack_to_docx(
-    pack: Dict,
-    tenant_name: str = "",
-    logo_url: str = "",
-    pd_logo_path: str = "assets/powerdash-logo.png",
-) -> bytes:
-    """
-    Expects pack with keys:
-      - title, inputs, housekeeping (list[str]), sections (list[{"name","notes","questions":[...]}])
-    """
-    doc = Document()
-    _set_document_defaults(doc)
+def _json_prompt(inputs: Dict) -> str:
+    return f"""
+You are an executive-search interviewer. Return ONLY valid JSON with this schema:
 
-    # Header
-    if logo_url:
-        try:
-            img = requests.get(logo_url, timeout=6).content
-            doc.add_picture(io.BytesIO(img), width=Inches(1.4))
-        except Exception:
-            pass
+{{
+  "housekeeping": [ "bullet point", ... ],
+  "sections": [
+    {{
+      "name": "Core Questions" | "Competency Questions" | "Technical Questions" | "Culture & Values" | "Closing Questions" | "Overview" | "Scoring Rubric",
+      "questions": [
+        {{
+          "question": "short behaviour-based question",
+          "intent": "why we ask it",
+          "followups": ["optional, short prompts"],
+          "good": "what good looks like (optional)"
+        }}
+      ],
+      "notes": "optional brief prose for this section"
+    }}
+  ]
+}}
 
-    p = doc.add_paragraph()
-    r = p.add_run(pack.get("title", "Interview Pack"))
-    r.bold = True
-    r.font.size = Pt(16)
+Guidance:
+- Language: {inputs.get('language','English')}; Jurisdiction: {inputs.get('jurisdiction','UK')}.
+- Role: {inputs.get('role_title')} · Level: {inputs.get('level')} · Dept: {inputs.get('department')}
+- Interview type: {inputs.get('interview_type')} · Duration: {inputs.get('duration_mins')} mins
+- Competencies: {", ".join(inputs.get('competencies', []))}
+- Include approx {inputs.get('num_core')} core, {inputs.get('num_technical')} technical, {inputs.get('num_competency')} competency questions.
+- Include follow-ups: {inputs.get('include_followups')}
+- Include "what good looks like": {inputs.get('include_good_looks_like')}
+- Include scoring rubric section: {inputs.get('include_scoring')}
+- House guidance (use if helpful): {inputs.get('house_guidance') or "None"}
 
-    meta = f"Interview type: {pack['inputs'].get('interview_type')} · Duration: {pack['inputs'].get('duration_mins')} mins"
-    doc.add_paragraph(meta)
-    if tenant_name:
-        t = doc.add_paragraph(tenant_name)
-        t.runs[0].font.size = Pt(10)
+Style:
+- Executive tone, inclusive, lawful; keep questions concise and behaviour-based.
+- Don’t include explanation outside the JSON. Return JSON only.
+"""
 
-    # Housekeeping
-    hk = pack.get("housekeeping") or []
-    if hk:
-        doc.add_paragraph("")
-        h = doc.add_paragraph("Housekeeping")
-        h.runs[0].bold = True
-        h.runs[0].font.size = Pt(14)
-        for item in hk:
-            para = doc.add_paragraph(item)
-            try:
-                para.style = doc.styles["List Bullet"]
-            except Exception:
-                pass
+def generate_interview_pack(inputs: Dict, model: str = "gpt-4.1-mini", temperature: float = 0.3) -> Dict:
+    client = _client()
+    prompt = _json_prompt(inputs)
 
-    # Sections
-    for sec in pack.get("sections", []):
-        doc.add_paragraph("")
-        s = doc.add_paragraph(sec.get("name", "Section"))
-        s.runs[0].bold = True
-        s.runs[0].font.size = Pt(14)
-        if sec.get("notes"):
-            doc.add_paragraph(sec["notes"])
-        for q in (sec.get("questions") or []):
-            _add_question_table(doc, q)
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": "You produce strictly valid JSON and nothing else."},
+            {"role": "user", "content": textwrap.dedent(prompt).strip()},
+        ],
+    )
+    data = json.loads(resp.choices[0].message.content)
 
-    # Footer logo/text on every page
-    _add_footer_powerdash(doc, pd_logo_path)
+    # Order sections predictably
+    by_name = {s.get("name"): s for s in data.get("sections", []) if isinstance(s, dict)}
+    ordered = [by_name[n] for n in SECTION_ORDER if n in by_name] + \
+              [s for s in data.get("sections", []) if s.get("name") not in SECTION_ORDER]
 
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
-
-# ------------------------------
-# Helpers (PDF)
-# ------------------------------
-def _wrap_lines(c, text: str, width: float, font="Helvetica", size=10):
-    words = (text or "").split()
-    line, out = "", []
-    for w in words:
-        t = (line + " " + w).strip()
-        if c.stringWidth(t, font, size) > width:
-            out.append(line)
-            line = w
-        else:
-            line = t
-    if line:
-        out.append(line)
-    return out
-
-def pack_to_pdf(
-    pack: Dict,
-    tenant_name: str = "",
-    logo_url: str = "",
-    pd_logo_path: str = "assets/powerdash-logo.png",
-) -> bytes:
-    """
-    Renders a polished PDF with PD footer logo on every page.
-    """
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-    x = 20 * mm
-    y = H - 20 * mm
-
-    # Client logo (top-left)
-    if logo_url:
-        try:
-            c.drawImage(ImageReader(logo_url), x, y - 15 * mm, width=30 * mm, height=15 * mm,
-                        preserveAspectRatio=True, mask="auto")
-        except Exception:
-            pass
-
-    # Title & meta
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x, y - 18 * mm, pack.get("title", "Interview Pack"))
-    c.setFont("Helvetica", 10)
-    meta = f"Interview type: {pack['inputs'].get('interview_type')} · Duration: {pack['inputs'].get('duration_mins')} mins"
-    c.drawString(x, y - 23 * mm, meta)
-    if tenant_name:
-        c.drawString(x, y - 28 * mm, tenant_name)
-
-    cur_y = y - 35 * mm
-
-    def footer():
-        fy = 12 * mm
-        try:
-            if pd_logo_path and os.path.exists(pd_logo_path):
-                img = ImageReader(pd_logo_path)
-                img_w = 14 * mm
-                img_h = 14 * mm
-                cx = W / 2
-                c.drawImage(img, cx - img_w - 12, fy - 3, width=img_w, height=img_h,
-                            preserveAspectRatio=True, mask="auto")
-                c.setFont("Helvetica-Oblique", 9)
-                c.drawString(cx - 12, fy + 3, "Powered by PowerDash HR")
-            else:
-                c.setFont("Helvetica-Oblique", 9)
-                c.drawCentredString(W / 2, fy + 3, "Powered by PowerDash HR")
-        except Exception:
-            c.setFont("Helvetica-Oblique", 9)
-            c.drawCentredString(W / 2, 12 * mm + 3, "Powered by PowerDash HR")
-
-    def ensure_space(lines_needed: int = 10):
-        nonlocal cur_y
-        if cur_y < (40 * mm + lines_needed * 12):
-            footer()
-            c.showPage()
-            cur_y = H - 20 * mm
-
-    def question_box(q: Dict):
-        nonlocal cur_y
-        left, right = x, W - x
-        top = cur_y
-
-        # Label/value rows
-        def row(label, val, label_min=80):
-            nonlocal cur_y
-            if not val:
-                return
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(left + 4, cur_y, f"{label}:")
-            label_w = max(label_min, c.stringWidth(f"{label}:", "Helvetica-Bold", 10))
-            c.setFont("Helvetica", 10)
-            for ln in _wrap_lines(c, val, right - left - 8 - label_w):
-                c.drawString(left + 4 + label_w, cur_y, ln)
-                cur_y -= 12
-
-        row("Question", (q.get("question") or "").strip(), label_min=80)
-        row("Intent", q.get("intent"), label_min=60)
+    # Build polished HTML preview (matches our CSS in app.py)
+    def qblock(q):
+        follow = ", ".join((q.get("followups") or [])[:6]) if q.get("followups") else ""
+        parts = [
+            "<div class='q-table'>",
+            f"<div class='q-row'><div class='q-label'>Question</div><div>{(q.get('question') or '').strip()}</div></div>",
+        ]
+        if q.get("intent"):
+            parts.append(f"<div class='q-row'><div class='q-label'>Intent</div><div>{q['intent']}</div></div>")
+        if follow:
+            parts.append(f"<div class='q-row'><div class='q-label'>Follow-ups</div><div>{follow}</div></div>")
         if q.get("good"):
-            row("What good looks like", q["good"], label_min=140)
-        if q.get("followups"):
-            row("Follow-ups", ", ".join(q["followups"][:6]), label_min=100)
+            parts.append(f"<div class='q-row'><div class='q-label'>What good looks like</div><div>{q['good']}</div></div>")
+        parts.append("<div class='q-notes'>" + "".join(["<div class='q-line'></div>" for _ in range(5)]) + "</div>")
+        parts.append("</div>")
+        return "\n".join(parts)
 
-        # Notes (5 ruled lines)
-        for _ in range(5):
-            c.setDash(1, 3)
-            c.line(left + 4, cur_y, right - 4, cur_y)
-            c.setDash()
-            cur_y -= 10
+    html = [
+        f"<h2 style='margin-bottom:0'>{inputs.get('role_title') or 'Interview Pack'}</h2>",
+        f"<div class='muted'>{inputs.get('interview_type')} interview · {inputs.get('duration_mins')} mins</div>",
+    ]
 
-        # Border box around the block
-        c.rect(left, cur_y, right - left, top - cur_y, stroke=1, fill=0)
-        cur_y -= 8
-
-    # Housekeeping
-    hk = pack.get("housekeeping") or []
+    hk = data.get("housekeeping") or []
     if hk:
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(x, cur_y, "Housekeeping")
-        cur_y -= 14
-        c.setFont("Helvetica", 10)
-        for item in hk:
-            for ln in _wrap_lines(c, "• " + item, W - 2 * x):
-                c.drawString(x, cur_y, ln)
-                cur_y -= 12
-        cur_y -= 6
-        ensure_space()
+        html.append("<div class='section-title'>Housekeeping</div>")
+        bullets = "".join(f"<li>{x}</li>" for x in hk if x)
+        html.append(f"<div class='callout'><ul>{bullets}</ul></div>")
 
-    # Sections
-    for sec in pack.get("sections", []):
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(x, cur_y, sec.get("name", "Section"))
-        cur_y -= 14
-
+    for sec in ordered:
+        name = sec.get("name") or "Section"
+        html.append(f"<div class='section-title'>{name}</div>")
         if sec.get("notes"):
-            c.setFont("Helvetica", 10)
-            for ln in _wrap_lines(c, sec["notes"], W - 2 * x):
-                c.drawString(x, cur_y, ln)
-                cur_y -= 12
-            cur_y -= 2
+            html.append(f"<div class='muted' style='margin:.25rem 0 .5rem'>{sec['notes']}</div>")
+        for q in sec.get("questions", []) or []:
+            html.append(qblock(q))
 
-        for q in sec.get("questions") or []:
-            ensure_space()
-            question_box(q)
-
-        ensure_space()
-
-    footer()
-    c.save()
-    buf.seek(0)
-    return buf.getvalue()
+    return {
+        "title": f"{inputs.get('role_title') or 'Interview'} — {inputs.get('interview_type')} Pack",
+        "slug": _slug(inputs.get("role_title")),
+        "inputs": inputs,
+        "housekeeping": hk,
+        "sections": ordered,          # structured JSON
+        "html_preview": "\n".join(html),
+    }
