@@ -13,7 +13,7 @@ SECTION_ORDER = [
     "Technical Questions",
     "Culture & Values",
     "Closing Questions",
-    "Close-down & Next Steps",   # ensure close-down guidance is captured
+    "Close-down & Next Steps",   # we’ll guarantee this exists
     "Scoring Rubric",
 ]
 
@@ -51,7 +51,8 @@ You are an executive-search interviewer. Return ONLY valid JSON with this schema
           "good": "what good looks like (optional)"
         }}
       ],
-      "notes": "optional brief prose for this section"
+      "notes": "optional brief prose for this section",
+      "bullets": ["optional bullet list for guidance"]
     }}
   ]
 }}
@@ -67,12 +68,12 @@ Guidance:
 - Include scoring rubric section: {inputs.get('include_scoring')}
 - House guidance (use if helpful): {inputs.get('house_guidance') or "None"}
 
-Make sure **Housekeeping** includes opener bullets (welcome, agenda, timings, consent, DEI/legal reminder),
-and **Close-down & Next Steps** includes thanking the candidate, what happens next, decision timelines, who contacts them, and how feedback is shared.
+Make sure **Housekeeping** includes opener bullets (welcome, agenda, timings, consent, DEI/legal reminder, note-taking),
+and include a section **"Close-down & Next Steps"** with bullets covering: thanking the candidate, what happens next, decision timelines, who contacts them, and how feedback is shared.
 
 Style:
 - Executive tone, inclusive, lawful; keep questions concise and behaviour-based.
-- Don’t include explanation outside the JSON. Return JSON only.
+- Return JSON only (no markdown or prose outside the JSON).
 """
 
 def generate_interview_pack(inputs: Dict, model: str = "gpt-4.1-mini", temperature: float = 0.3) -> Dict:
@@ -89,12 +90,38 @@ def generate_interview_pack(inputs: Dict, model: str = "gpt-4.1-mini", temperatu
             {"role": "user", "content": textwrap.dedent(prompt).strip()},
         ],
     )
-    data = json.loads(resp.choices[0].message.content)
+    data = json.loads(resp.choices[0].message.content or "{}")
 
-    # Normalise section order
-    by_name = {s.get("name"): s for s in data.get("sections", []) if isinstance(s, dict)}
+    # Normalize sections and enforce order
+    by_name = { (s.get("name") or "").strip(): s for s in data.get("sections", []) if isinstance(s, dict) }
     ordered: List[Dict] = [by_name[n] for n in SECTION_ORDER if n in by_name] + \
-                          [s for s in data.get("sections", []) if s.get("name") not in SECTION_ORDER]
+                          [s for s in data.get("sections", []) if (s.get("name") or "") not in SECTION_ORDER]
+
+    # Ensure Close-down section exists (create a sensible default if the model omitted it)
+    close_exists = any((s.get("name") or "").strip().lower() in {"close-down & next steps", "close down & next steps", "close-down", "next steps"} for s in ordered)
+    if not close_exists:
+        ordered.append({
+            "name": "Close-down & Next Steps",
+            "bullets": [
+                "Thank the candidate for their time and engagement.",
+                "Outline next steps in the process and expected timelines.",
+                "Confirm who will contact them and by when.",
+                "Explain how feedback will be shared and through which channel.",
+                "Invite final questions and ensure the candidate knows how to follow up."
+            ],
+            "questions": [],
+            "notes": "",
+        })
+
+    # Clean up questions (ensure trailing '?', strip, etc.)
+    for sec in ordered:
+        for q in (sec.get("questions") or []):
+            qt = (q.get("question") or "").strip()
+            if qt and not qt.endswith("?"):
+                # add '?' if it looks like a question and doesn't already end with punctuation
+                if not qt.endswith((".", "!", "?”", ".”", "!”")):
+                    qt += "?"
+            q["question"] = qt
 
     # ---------- Build polished HTML preview ----------
     def qblock(q: Dict) -> str:
@@ -109,7 +136,8 @@ def generate_interview_pack(inputs: Dict, model: str = "gpt-4.1-mini", temperatu
             parts.append(f"<div class='q-row'><div class='q-label'>Follow-ups</div><div>{follow}</div></div>")
         if q.get("good"):
             parts.append(f"<div class='q-row'><div class='q-label'>What good looks like</div><div>{q['good']}</div></div>")
-        parts.append("<div class='q-notes'>" + "".join(["<div class='q-line'></div>" for _ in range(5)]) + "</div>")
+        # white-space notes (no dots)
+        parts.append("<div style='height:72px'></div>")
         parts.append("</div>")
         return "\n".join(parts)
 
@@ -127,6 +155,10 @@ def generate_interview_pack(inputs: Dict, model: str = "gpt-4.1-mini", temperatu
     for sec in ordered:
         name = sec.get("name") or "Section"
         html_parts.append(f"<div class='section-title'>{name}</div>")
+        # bullets list (for close-down etc.)
+        bullets = sec.get("bullets") or []
+        if bullets:
+            html_parts.append(f"<div class='callout'><ul>{''.join(f'<li>{b}</li>' for b in bullets)}</ul></div>")
         if sec.get("notes"):
             html_parts.append(f"<div class='muted' style='margin:.25rem 0 .5rem'>{sec['notes']}</div>")
         for q in sec.get("questions", []) or []:
