@@ -7,6 +7,8 @@ from docx import Document
 from docx.shared import Pt, Inches
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ROW_HEIGHT_RULE
 
 # ---------- PDF ----------
 from reportlab.lib.pagesizes import A4
@@ -14,7 +16,10 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 
-FONT_NAME = "Source Sans 3"
+FONT_NAME = "Source Sans 3"      # fallback to Calibri if not present
+LABEL_COL_IN = 1.2               # DOCX label column width
+VALUE_COL_IN = 5.8               # DOCX value column width
+NOTES_HEIGHT_PT = 100            # ~6–7 lines of whitespace
 
 # ==============================
 # DOCX helpers
@@ -26,68 +31,125 @@ def _set_document_defaults(doc: Document):
     style.font.size = Pt(11)
 
 def _add_footer_powerdash(doc: Document, pd_logo_path: str):
-    # Footer on every section → repeats on every page
+    """Footer on every section → repeats on every page."""
     for section in doc.sections:
         footer = section.footer
         footer.is_linked_to_previous = False
         p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+        p.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
         run = p.add_run()
         try:
             if pd_logo_path and os.path.exists(pd_logo_path):
-                run.add_picture(pd_logo_path, width=Inches(0.6))
+                run.add_picture(pd_logo_path, width=Inches(0.22))
                 p.add_run("  Powered by PowerDash HR").italic = True
             else:
                 p.add_run("Powered by PowerDash HR").italic = True
         except Exception:
             p.add_run("Powered by PowerDash HR").italic = True
 
+def _set_tbl_borders(tbl, size="6", color="000000"):
+    """Apply a thin box border to the whole table (Word)."""
+    tbl_pr = tbl._element.tblPr
+    borders = tbl_pr.tblBorders if tbl_pr.tblBorders is not None else OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), size)
+        el.set(qn("w:color"), color)
+        borders.append(el)
+    tbl_pr.append(borders)
+
+def _set_tbl_cell_margins(tbl, top=120, start=120, bottom=120, end=120):
+    """Cell padding (twips)."""
+    def _marg(tag, val):
+        el = OxmlElement(tag)
+        el.set(qn("w:w"), str(val))
+        el.set(qn("w:type"), "dxa")
+        return el
+    tbl_pr = tbl._element.tblPr
+    mar = tbl_pr.tblCellMar if tbl_pr.tblCellMar is not None else OxmlElement("w:tblCellMar")
+    mar.append(_marg("w:top", top))
+    mar.append(_marg("w:start", start))
+    mar.append(_marg("w:bottom", bottom))
+    mar.append(_marg("w:end", end))
+    tbl_pr.append(mar)
+
+def _set_row_height(row, points: int, rule=WD_ROW_HEIGHT_RULE.EXACTLY):
+    row.height = Pt(points)
+    row.height_rule = rule
+
+def _para(p, text="", bold=False, size=11, space_after=4):
+    r = p.add_run(text)
+    r.bold = bold
+    r.font.size = Pt(size)
+    p.paragraph_format.space_after = Pt(space_after)
+    return p
+
 def _add_question_table(doc: Document, q: Dict):
     """
-    DOCX: Question uses a full-width row (merged across both columns),
-    then label/value rows for Intent / Follow-ups / What good looks like,
-    followed by WHITE SPACE (no dots) for notes.
+    Word layout to mirror PDF:
+      - Table with borders (the 'box')
+      - Row 1: Question (merged full width), bold, with extra top padding
+      - Row 2..n: label/value rows
+      - Last row: blank 'notes' cell with fixed height (whitespace, no dots)
     """
-    tbl = doc.add_table(rows=0, cols=2)
+    tbl = doc.add_table(rows=1, cols=2)
     tbl.autofit = False
+    tbl.alignment = WD_TABLE_ALIGNMENT.LEFT
 
-    # Set explicit column widths (label narrow, value wide)
+    # Column widths
     try:
-        tbl.columns[0].width = Inches(1.2)
-        tbl.columns[1].width = Inches(5.8)
+        tbl.columns[0].width = Inches(LABEL_COL_IN)
+        tbl.columns[1].width = Inches(VALUE_COL_IN)
     except Exception:
         pass
 
-    # --- QUESTION (full width) ---
-    row = tbl.add_row().cells
+    _set_tbl_borders(tbl, size="8", color="222222")
+    _set_tbl_cell_margins(tbl, top=160, start=160, bottom=140, end=160)  # generous padding
+
+    # --- Question row (merged full width, with extra top space) ---
+    first = tbl.rows[0].cells
     try:
-        qcell = row[0].merge(row[1])
+        qcell = first[0].merge(first[1])
     except Exception:
-        qcell = row[0]
-    q_para = qcell.paragraphs[0]
-    q_run = q_para.add_run((q.get("question") or "").strip())
-    q_run.bold = True
-    q_para.space_after = Pt(6)
+        qcell = first[0]
+    qp = qcell.paragraphs[0]
+    _para(qp, (q.get("question") or "").strip(), bold=True, size=12, space_after=6)
+    # Add a tiny blank paragraph to simulate extra top padding visually
+    qcell.add_paragraph("")
 
     # helper for label/value rows
-    def add_row(label, val):
-        if not val:
+    def add_row(label: str, value: str):
+        if not value:
             return
-        r = tbl.add_row().cells
-        lbl_para = r[0].paragraphs[0]; lbl_run = lbl_para.add_run(label); lbl_run.bold = True
-        r[1].paragraphs[0].add_run(val)
+        row = tbl.add_row()
+        # label cell
+        lp = row.cells[0].paragraphs[0]
+        _para(lp, label + ":", bold=True, size=11, space_after=2)
+        # value cell
+        vp = row.cells[1].paragraphs[0]
+        _para(vp, value, bold=False, size=11, space_after=2)
 
     if q.get("intent"):
         add_row("Intent", q["intent"])
-    if q.get("followups"):
-        add_row("Follow-ups", ", ".join(q["followups"][:6]))
     if q.get("good"):
         add_row("What good looks like", q["good"])
+    if q.get("followups"):
+        add_row("Follow-ups", ", ".join(q["followups"][:6]))
 
-    # --- White-space notes (no dotted lines) ---
-    for _ in range(4):
-        p = doc.add_paragraph(" ")
-        p.paragraph_format.space_after = Pt(8)
-    doc.add_paragraph("")
+    # --- Notes whitespace row ---
+    notes_row = tbl.add_row()
+    # Merge both cells so the space spans full width (cleaner look)
+    try:
+        notes_cell = notes_row.cells[0].merge(notes_row.cells[1])
+    except Exception:
+        notes_cell = notes_row.cells[0]
+    # Force row height for whitespace area
+    _set_row_height(notes_row, NOTES_HEIGHT_PT, rule=WD_ROW_HEIGHT_RULE.EXACTLY)
+    notes_cell.paragraphs[0].add_run("")  # keep empty
+
+    # Spacer after the table
+    doc.add_paragraph("").paragraph_format.space_after = Pt(8)
 
 def pack_to_docx(
     pack: Dict,
@@ -97,12 +159,13 @@ def pack_to_docx(
 ) -> bytes:
     """
     Expects pack with:
-      title, inputs, housekeeping (list[str]), sections (list[{name, notes, bullets?, questions[]}])
+      title, inputs, housekeeping (list[str]),
+      sections (list[{name, notes, bullets?, questions[]}])
     """
     doc = Document()
     _set_document_defaults(doc)
 
-    # Header
+    # Header area
     if logo_url:
         try:
             img = requests.get(logo_url, timeout=6).content
@@ -110,50 +173,59 @@ def pack_to_docx(
         except Exception:
             pass
 
-    p = doc.add_paragraph()
-    r = p.add_run(pack.get("title", "Interview Pack")); r.bold = True; r.font.size = Pt(16)
+    title_p = doc.add_paragraph()
+    _para(title_p, pack.get("title", "Interview Pack"), bold=True, size=16, space_after=2)
+    meta_p = doc.add_paragraph()
     meta = f"Interview type: {pack['inputs'].get('interview_type')} · Duration: {pack['inputs'].get('duration_mins')} mins"
-    doc.add_paragraph(meta)
+    _para(meta_p, meta, size=11, space_after=0)
     if tenant_name:
-        t = doc.add_paragraph(tenant_name); t.runs[0].font.size = Pt(10)
+        _para(doc.add_paragraph(), tenant_name, size=10, space_after=0)
 
-    # Housekeeping
+    # Housekeeping bullets
     hk = pack.get("housekeeping") or []
     if hk:
-        doc.add_paragraph("")
-        h = doc.add_paragraph("Housekeeping"); h.runs[0].bold = True; h.runs[0].font.size = Pt(14)
+        doc.add_paragraph("")  # spacer
+        _para(doc.add_paragraph(), "Housekeeping", bold=True, size=14, space_after=4)
         for item in hk:
-            para = doc.add_paragraph(item)
+            bp = doc.add_paragraph(item)
             try:
-                para.style = doc.styles["List Bullet"]
+                bp.style = doc.styles["List Bullet"]
             except Exception:
                 pass
 
     # Sections
     for sec in pack.get("sections", []):
-        doc.add_paragraph("")
-        s = doc.add_paragraph(sec.get("name", "Section")); s.runs[0].bold = True; s.runs[0].font.size = Pt(14)
+        doc.add_paragraph("")  # section spacer
+        _para(doc.add_paragraph(), sec.get("name", "Section"), bold=True, size=14, space_after=4)
+
+        # Optional bullets (e.g., Close-down & Next Steps)
         bullets = sec.get("bullets") or []
         if bullets:
             for item in bullets:
-                para = doc.add_paragraph(item)
+                bp = doc.add_paragraph(item)
                 try:
-                    para.style = doc.styles["List Bullet"]
+                    bp.style = doc.styles["List Bullet"]
                 except Exception:
                     pass
+
+        # Optional notes
         if sec.get("notes"):
-            doc.add_paragraph(sec["notes"])
+            _para(doc.add_paragraph(), sec["notes"], size=11, space_after=4)
+
+        # Questions
         for q in (sec.get("questions") or []):
             _add_question_table(doc, q)
 
-    # Footer
+    # Footer every page
     _add_footer_powerdash(doc, pd_logo_path)
 
-    buf = io.BytesIO(); doc.save(buf); buf.seek(0)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
     return buf.getvalue()
 
 # ==============================
-# PDF exporter (with generous spacing)
+# PDF exporter (already tuned)
 # ==============================
 def _wrap_lines(c, text: str, width: float, font="Helvetica", size=11):
     words = (text or "").split()
@@ -187,13 +259,13 @@ def pack_to_pdf(
     MARGIN_X     = 22 * mm
     TOP_Y        = H - 22 * mm
     LINE         = 16          # line height
-    PAD_TOP      = 12          # NEW: more top inset inside the box
+    PAD_TOP      = 12          # top inset inside box
     PAD_BOTTOM   = 8           # bottom inset
-    NOTES_LINES  = 8           # blank "lines" worth of note space
+    NOTES_LINES  = 8           # blank lines
     SECTION_GAP  = 10          # gap before section titles
-    BLOCK_GAP    = 14          # gap after each question box
-    BOTTOM_BUF   = 65 * mm     # bottom buffer to avoid crowding footer
-    TOP_START_GAP = 12 * mm    # buffer at top after a page break
+    BLOCK_GAP    = 14          # gap after each box
+    BOTTOM_BUF   = 65 * mm     # bottom buffer
+    TOP_START_GAP = 12 * mm    # start lower on new page
 
     x = MARGIN_X
     y = TOP_Y
@@ -219,24 +291,14 @@ def pack_to_pdf(
             c.drawCentredString(W / 2, 12 * mm + 3, "Powered by PowerDash HR")
 
     def _wrap(text, width, font="Helvetica", size=11):
-        words = (text or "").split()
-        out, line = [], ""
-        for w in words:
-            t = (line + " " + w).strip()
-            if c.stringWidth(t, font, size) > width:
-                if line: out.append(line)
-                line = w
-            else:
-                line = t
-        if line: out.append(line)
-        return out
+        return _wrap_lines(c, text, width, font=font, size=size)
 
     def ensure_space(px_needed: float):
         nonlocal cur_y
         if cur_y - px_needed < BOTTOM_BUF:
             footer()
             c.showPage()
-            cur_y = TOP_Y - TOP_START_GAP   # start a little lower on new page
+            cur_y = TOP_Y - TOP_START_GAP
 
     # ---------- header ----------
     if logo_url:
@@ -268,11 +330,11 @@ def pack_to_pdf(
 
     draw_bullets("Housekeeping", pack.get("housekeeping") or [])
 
-    # ---------- question block (pre-measured, asymmetric padding) ----------
+    # ---------- question block ----------
     def question_block(q: Dict):
         nonlocal cur_y
         left, right = x, W - x
-        text_width = right - left - (PAD_TOP + PAD_BOTTOM)  # inner width (pad top used only vertically; fine to reuse)
+        text_width = right - left - (PAD_TOP + PAD_BOTTOM)
 
         q_lines  = _wrap((q.get("question") or "").strip(), text_width, font="Helvetica-Bold", size=12)
         intent_lines = _wrap(q.get("intent") or "", text_width - 90, size=11)
@@ -285,25 +347,21 @@ def pack_to_pdf(
         if good_lines:   rows_h += LINE * (len(good_lines)+1)
         if fup_lines:    rows_h += LINE * (len(fup_lines)+1)
         notes_h = NOTES_LINES * LINE
-
         block_h = PAD_TOP + rows_h + notes_h + PAD_BOTTOM
+
         ensure_space(block_h + BLOCK_GAP)
 
-        # container
         bottom_y = cur_y - block_h
         c.setLineWidth(1)
         c.roundRect(left, bottom_y, right-left, block_h, 6, stroke=1, fill=0)
 
-        # text start (drop further from top border)
         ty = cur_y - PAD_TOP
 
-        # Question
         c.setFont("Helvetica-Bold", 12)
         for ln in q_lines:
             c.drawString(left + PAD_TOP, ty, ln); ty -= LINE
         ty -= 2
 
-        # Label/value rows
         def row(lbl, lines, label_min):
             nonlocal ty
             if not lines: return
@@ -319,10 +377,7 @@ def pack_to_pdf(
         if good_lines:   row("What good looks like", good_lines, label_min=150)
         if fup_lines:    row("Follow-ups", fup_lines, label_min=110)
 
-        # white-space notes
-        ty -= notes_h
-
-        # gap after box
+        ty -= notes_h     # white space for notes
         cur_y = bottom_y - BLOCK_GAP
 
     # ---------- draw sections & questions ----------
