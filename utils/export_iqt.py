@@ -47,32 +47,65 @@ def _add_footer_powerdash(doc: Document, pd_logo_path: str):
         except Exception:
             p.add_run("Powered by PowerDash HR").italic = True
 
-def _set_tbl_borders(tbl, size="6", color="000000"):
-    """Apply a thin box border to the whole table (Word)."""
-    tbl_pr = tbl._element.tblPr
-    borders = tbl_pr.tblBorders if tbl_pr.tblBorders is not None else OxmlElement("w:tblBorders")
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+def _set_tbl_borders(table, size="8", color="222222"):
+    """
+    Apply box borders to a python-docx table by manipulating the XML.
+    Works across python-docx versions (no .tblBorders attribute access).
+    """
+    tbl = table._element
+    tblPr = tbl.tblPr
+    if tblPr is None:
+        tblPr = OxmlElement("w:tblPr")
+        tbl.append(tblPr)
+
+    # remove any existing borders node
+    existing = tblPr.find(qn("w:tblBorders"))
+    if existing is not None:
+        tblPr.remove(existing)
+
+    borders = OxmlElement("w:tblBorders")
     for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
         el = OxmlElement(f"w:{edge}")
         el.set(qn("w:val"), "single")
-        el.set(qn("w:sz"), size)
+        el.set(qn("w:sz"), str(size))     # size in eighths of a point (string)
         el.set(qn("w:color"), color)
+        el.set(qn("w:space"), "0")
         borders.append(el)
-    tbl_pr.append(borders)
 
-def _set_tbl_cell_margins(tbl, top=120, start=120, bottom=120, end=120):
-    """Cell padding (twips)."""
+    tblPr.append(borders)
+
+def _set_tbl_cell_margins(table, top=160, start=160, bottom=140, end=160):
+    """
+    Set table cell padding (margins) in twips. Creates <w:tblCellMar> if needed.
+    """
     def _marg(tag, val):
         el = OxmlElement(tag)
-        el.set(qn("w:w"), str(val))
+        el.set(qn("w:w"), str(val))   # twips
         el.set(qn("w:type"), "dxa")
         return el
-    tbl_pr = tbl._element.tblPr
-    mar = tbl_pr.tblCellMar if tbl_pr.tblCellMar is not None else OxmlElement("w:tblCellMar")
+
+    tbl = table._element
+    tblPr = tbl.tblPr
+    if tblPr is None:
+        tblPr = OxmlElement("w:tblPr")
+        tbl.append(tblPr)
+
+    mar = tblPr.find(qn("w:tblCellMar"))
+    if mar is None:
+        mar = OxmlElement("w:tblCellMar")
+        tblPr.append(mar)
+    else:
+        # clear existing margins to avoid duplicates
+        for child in list(mar):
+            mar.remove(child)
+
     mar.append(_marg("w:top", top))
     mar.append(_marg("w:start", start))
     mar.append(_marg("w:bottom", bottom))
     mar.append(_marg("w:end", end))
-    tbl_pr.append(mar)
 
 def _set_row_height(row, points: int, rule=WD_ROW_HEIGHT_RULE.EXACTLY):
     row.height = Pt(points)
