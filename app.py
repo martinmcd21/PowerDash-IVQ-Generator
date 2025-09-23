@@ -1,26 +1,24 @@
 # app.py — Interview Question Pack Generator (PowerDash HR)
-import os
-import io
-import textwrap
-from datetime import datetime
 
+import os
+from datetime import datetime
 import streamlit as st
 
-# ---- Local utils ----
+# Local utils
 from utils.generation_iqt import generate_interview_pack
 from utils.export_iqt import pack_to_docx, pack_to_pdf
 
-# ---- Optional imports for JD parsing ----
+# Optional imports for JD parsing
 try:
     from docx import Document as DocxDocument
 except Exception:
     DocxDocument = None
 
-# pypdf is in requirements.txt
 try:
     import pypdf
 except Exception:
     pypdf = None
+
 
 # =====================
 # Page config & styles
@@ -35,39 +33,31 @@ PRIMARY_ACCENT = st.session_state.get("primary_accent", "#111827")  # slate-900 
 
 APP_CSS = f"""
 <style>
-/* Tighter container + nicer section titles */
 h2,h3,h4 {{ margin-bottom: .35rem; }}
-.section-title {{
-  margin: 1rem 0 .5rem;
-  font-weight: 700;
-  font-size: 1.15rem;
-}}
-.callout {{
-  background: #f7f7fb;
-  border: 1px solid #ececf2;
-  border-radius: 8px;
-  padding: .6rem .8rem;
-}}
+.section-title {{ margin: 1rem 0 .5rem; font-weight: 700; font-size: 1.15rem; }}
+.callout {{ background: #f7f7fb; border: 1px solid #ececf2; border-radius: 8px; padding: .6rem .8rem; }}
 .muted {{ color: #6b7280; font-size:.9rem; }}
-footer {{ visibility: hidden; }} /* hide default Streamlit footer */
-.powered {
+footer {{ visibility: hidden; }}
+
+.powered {{
   display:inline-flex; align-items:center; gap:.35rem;
   background:#fff7e5; border:1px solid #ffe2a7; color:#111827;
   border-radius:999px; padding:.25rem .6rem; font-size:.85rem;
-}
-.btn-primary .st-emotion-cache-ocqkz7, .stButton>button[kind="primary"] {{
+}}
+
+.stButton>button[kind="primary"] {{
   background:{PRIMARY_ACCENT} !important;
 }}
+
 .small {{ font-size:.85rem; color:#6b7280 }}
-.preview {{
-  border:1px solid #e5e7eb; border-radius:10px; padding:1rem; background:#fff;
-}}
+.preview {{ border:1px solid #e5e7eb; border-radius:10px; padding:1rem; background:#fff; }}
 .q-table{{ border:1px solid #e5e7eb; border-radius:10px; padding:.75rem; margin:.5rem 0 1rem; }}
 .q-row{{ display:grid; grid-template-columns:150px 1fr; gap:.5rem; margin:.15rem 0; }}
 .q-label{{ font-weight:700; color:#111827; }}
 </style>
 """
 st.markdown(APP_CSS, unsafe_allow_html=True)
+
 
 # =====================
 # Sidebar — Settings
@@ -80,7 +70,7 @@ st.session_state["primary_accent"] = primary_colour
 client_logo_url = st.sidebar.text_input("Client logo URL (optional)", value="")
 show_powered = st.sidebar.toggle("Show 'Powered by PowerDash HR'", value=True)
 
-# --- Model picker (safe, prefilled) ---
+# Model picker (safe options)
 MODEL_OPTIONS = [
     ("gpt-4.1-mini", "Fast & cost-efficient (recommended)"),
     ("gpt-4.1",      "Higher reasoning (slower, pricier)"),
@@ -98,7 +88,7 @@ creativity = st.sidebar.slider("Creativity (temperature)", 0.0, 1.0, 0.30, 0.05)
 language = st.sidebar.selectbox("Language", ["English", "French", "Spanish", "German", "Italian"], index=0)
 jurisdiction = st.sidebar.selectbox("Jurisdiction", ["UK", "EU", "US", "Global"], index=0)
 
-# --- Optional Job Description upload (txt/docx/pdf) ---
+# Optional Job Description upload
 st.sidebar.markdown("---")
 jd_file = st.sidebar.file_uploader("Upload job description (optional)", type=["txt", "docx", "pdf"])
 jd_raw = None
@@ -121,6 +111,7 @@ if jd_file is not None:
                 jd_raw = "\n".join((page.extract_text() or "") for page in reader.pages)
     except Exception as e:
         st.sidebar.warning(f"Could not read file: {e}")
+
 
 # =====================
 # Main — Inputs
@@ -174,14 +165,14 @@ with cA:
 with cB:
     duration_mins = st.number_input("Duration (mins)", min_value=15, max_value=180, value=60, step=5)
 with cC:
-    pass  # spare slot
+    pass
+
 
 # =====================
 # JD summary (optional)
 # =====================
 jd_summary = None
 if jd_raw:
-    # Summarize to avoid long prompts; safe default is the selected model
     try:
         from openai import OpenAI
         api_key = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
@@ -202,10 +193,11 @@ if jd_raw:
         st.sidebar.warning(f"JD summary failed; using raw snippet. ({e})")
         jd_summary = jd_raw[:2000]
 
+
 # =====================
 # Generate
 # =====================
-if st.button("Generate Interview Pack", type="primary", use_container_width=False):
+if st.button("Generate Interview Pack", type="primary"):
     competencies = [c.strip() for c in competencies_text.splitlines() if c.strip()]
 
     inputs = {
@@ -235,6 +227,7 @@ if st.button("Generate Interview Pack", type="primary", use_container_width=Fals
         st.success("Interview pack generated.")
     except Exception as e:
         st.error(f"Could not load generator module: {e}")
+
 
 # =====================
 # Preview & Export
@@ -293,11 +286,9 @@ if pack:
     except Exception as e:
         st.warning(f"PDF export failed: {e}")
 
-# =====================
-# Footer badge (page)
-# =====================
-st.markdown(
-    '<div style="margin-top:2rem" class="powered">⚡ Powered by <strong>PowerDash HR</strong></div>'
-    if show_powered else "",
-    unsafe_allow_html=True,
-)
+# Footer badge
+if show_powered:
+    st.markdown(
+        '<div style="margin-top:2rem" class="powered">⚡ Powered by <strong>PowerDash HR</strong></div>',
+        unsafe_allow_html=True,
+    )
